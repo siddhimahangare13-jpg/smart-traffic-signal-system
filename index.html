@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Traffic Signal Control</title>
+<style>
+:root{--bg:#e8ecef;--panel:#f7f9fa;--ink:#1c2530;--mute:#5d6b78;--line:#cfd7de;--road:#3a4047;--go:#1f9d55;--stop:#d64545;--amb:#f2a900;--fix:#7a8794;--ada:#0b7a75}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Bahnschrift","DIN Alternate","Segoe UI",system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center;justify-content:space-between;padding:16px 24px;background:var(--ink);color:#fff}
+h1{margin:0;font-size:20px;font-weight:600}
+.ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+select,button{font:inherit;padding:8px 14px;border-radius:6px;border:1px solid #fff4;background:#fff1;color:#fff}
+select option{color:#000}
+button.go{background:var(--amb);color:#1c2530;border-color:var(--amb);font-weight:600}
+button:focus-visible,select:focus-visible{outline:3px solid var(--amb);outline-offset:2px}
+main{max-width:1060px;margin:0 auto;padding:20px}
+.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+.panel h2{margin:0 0 6px;font-size:16px;font-weight:600;display:flex;justify-content:space-between}
+.panel h2 span{color:var(--mute);font-weight:400;font-size:14px}
+canvas{width:100%;height:auto;display:block}
+#alert{height:22px;color:var(--stop);font-weight:600;margin:10px 0 0;text-align:center}
+table{width:100%;border-collapse:collapse;margin-top:6px}
+th,td{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+th{font-weight:600;color:var(--mute);font-size:14px}
+td.win{color:var(--ada);font-weight:700}
+.sec{margin-top:20px}
+.note{color:var(--mute);font-size:13px;margin:6px 2px 0}
+</style></head><body>
+<header>
+ <h1>Smart traffic signal control: fixed-time vs adaptive</h1>
+ <div class="ctl">
+  <label>Scenario <select id="sc"></select></label>
+  <label>Speed <select id="sp"><option value="3">Slow</option><option value="6" selected>Normal</option><option value="15">Fast</option><option value="40">Very fast</option></select></label>
+  <button class="go" id="go">Start simulation</button>
+  <button id="rs">Restart</button>
+ </div>
+</header>
+<main>
+ <div id="alert" aria-live="polite"></div>
+ <div class="pair">
+  <section class="panel"><h2>Fixed-time <span>30 s green, round robin</span></h2><canvas id="c0" width="380" height="440"></canvas></section>
+  <section class="panel"><h2>Adaptive (C scheduler) <span>heap + aging + preemption</span></h2><canvas id="c1" width="380" height="440"></canvas></section>
+ </div>
+ <section class="panel sec"><h2>Vehicles waiting over time <span id="clock">0 s</span></h2><canvas id="ch" width="1000" height="220"></canvas>
+  <p class="note">Grey: fixed-time. Teal: adaptive. Both modes see exactly the same vehicle arrivals.</p></section>
+ <section class="panel sec"><h2>Results from the C program</h2><table id="tb"></table></section>
+</main>
+<script src="data.js"></script>
+<script>
+const D=TRAFFIC_DATA,T=D.ticks,NAMES=["N","S","E","W"],CAP=60;
+const $=id=>document.getElementById(id);
+const C=[$("c0").getContext("2d"),$("c1").getContext("2d")],CH=$("ch").getContext("2d");
+let S=D.scenarios[0],pos=0,playing=false,last=0;
+D.scenarios.forEach((s,i)=>$("sc").add(new Option(s.label,i)));
+
+/* geometry: stop-line point, direction cars queue back, light position */
+const cx=190,cy=190,LN=[
+ {sx:cx-20,sy:cy-44,bx:0,by:-1,lx:cx-52,ly:cy-44},
+ {sx:cx+20,sy:cy+44,bx:0,by:1,lx:cx+52,ly:cy+44},
+ {sx:cx+44,sy:cy-20,bx:1,by:0,lx:cx+44,ly:cy-52},
+ {sx:cx-44,sy:cy+20,bx:-1,by:0,lx:cx-44,ly:cy+52}];
+
+function car(g,x,y,vert,col,amb){
+ const w=vert?11:15,h=vert?15:11;
+ g.fillStyle=col;g.fillRect(x-w/2,y-h/2,w,h);
+ if(amb){g.fillStyle="#fff";g.fillRect(x-w/2+1,y-h/2+1,w-2,h-2);g.fillStyle="#d64545";
+  g.fillRect(x-1.5,y-4.5,3,9);g.fillRect(x-4.5,y-1.5,9,3);}
+}
+function draw(g,fr,frac){
+ g.clearRect(0,0,380,440);
+ g.fillStyle="#dfe5e9";g.fillRect(0,0,380,440);
+ g.fillStyle="#3a4047";g.fillRect(0,cy-40,380,80);g.fillRect(cx-40,0,80,380);
+ g.strokeStyle="#e8e8e8";g.lineWidth=2;g.setLineDash([10,10]);
+ g.beginPath();g.moveTo(0,cy);g.lineTo(cx-40,cy);g.moveTo(cx+40,cy);g.lineTo(380,cy);
+ g.moveTo(cx,0);g.lineTo(cx,cy-40);g.moveTo(cx,cy+40);g.lineTo(cx,380);g.stroke();g.setLineDash([]);
+ g.fillStyle="#2f353b";g.fillRect(cx-40,cy-40,80,80);
+ const gl=fr[0];
+ for(let l=0;l<4;l++){
+  const L=LN[l],q=fr[2+l],e=fr[6+l],vis=Math.min(q,9);
+  g.strokeStyle="#fff";g.lineWidth=3;g.beginPath();
+  if(L.bx)g.moveTo(L.sx,L.sy-20),g.lineTo(L.sx,L.sy+20);else g.moveTo(L.sx-20,L.sy),g.lineTo(L.sx+20,L.sy);
+  g.stroke();
+  for(let k=0;k<vis;k++){
+   const x=L.sx+L.bx*(k*17+12),y=L.sy+L.by*(k*17+12),isA=e===k+1;
+   car(g,x,y,!!L.by,isA?"#fff":["#5aa9e6","#e6a35a","#8fcf8f","#c58fcf"][(k+l)%4],isA);
+  }
+  g.fillStyle="#1c2530";g.font="600 12px sans-serif";g.textAlign="center";
+  if(q>9){const bx=L.sx+L.bx*172,by=L.sy+L.by*172;g.fillText("+"+(q-9),bx+(L.bx?0:L.by?-18:0),by+4)}
+  if(e>9){g.fillStyle="#d64545";g.fillText("AMB",L.sx+L.bx*165+(L.by?26:0),L.sy+L.by*165+(L.bx?26:0))}
+  const on=gl===l;
+  g.fillStyle="#1c2530";g.beginPath();g.arc(L.lx,L.ly,10,0,7);g.fill();
+  g.fillStyle=on?"#1f9d55":"#d64545";g.beginPath();g.arc(L.lx,L.ly,7,0,7);g.fill();
+  if(on){g.fillStyle="#fff";g.font="700 12px sans-serif";g.fillText(fr[1]+"s",L.lx+(L.bx?0:L.by*-1*0),L.ly+(L.bx?-16:(L.lx<cx?-16:-16)))}
+ }
+ if(fr[10]){const L=LN[gl],d=frac*140,x=L.sx-L.bx*d,y=L.sy-L.by*d;
+  const em=fr[10]===2;car(g,x,y,!!L.by,em?"#fff":"#f2f2f2",em);}
+ g.textAlign="left";
+ for(let l=0;l<4;l++){ /* density bars */
+  const x=12+l*92,y=392;
+  g.fillStyle="#1c2530";g.font="600 12px sans-serif";g.fillText(NAMES[l]+"  "+fr[2+l],x,y);
+  g.fillStyle="#c5cdd4";g.fillRect(x,y+8,80,9);
+  const r=fr[2+l]/CAP;g.fillStyle=r>.6?"#d64545":r>.3?"#f2a900":"#1f9d55";g.fillRect(x,y+8,80*r,9);
+ }
+ g.fillStyle="#5d6b78";g.font="12px sans-serif";g.fillText("Vehicles waiting per lane",12,432);
+}
+function chart(){
+ const W=1000,H=220,p=34;CH.clearRect(0,0,W,H);
+ const a=S.fixed.f.map(f=>f[2]+f[3]+f[4]+f[5]),b=S.adaptive.f.map(f=>f[2]+f[3]+f[4]+f[5]);
+ const mx=Math.max(10,...a,...b);
+ CH.strokeStyle="#cfd7de";CH.fillStyle="#5d6b78";CH.font="12px sans-serif";CH.lineWidth=1;
+ for(let i=0;i<=4;i++){const y=H-p-(H-2*p)*i/4;CH.beginPath();CH.moveTo(p,y);CH.lineTo(W-10,y);CH.stroke();CH.fillText(Math.round(mx*i/4),4,y+4)}
+ const X=t=>p+(W-p-10)*t/(T-1),Y=v=>H-p-(H-2*p)*v/mx;
+ [[a,"#7a8794"],[b,"#0b7a75"]].forEach(([s,c])=>{CH.strokeStyle=c;CH.lineWidth=2.5;CH.beginPath();s.forEach((v,t)=>t?CH.lineTo(X(t),Y(v)):CH.moveTo(X(t),Y(v)));CH.stroke()});
+ CH.strokeStyle="#1c2530";CH.lineWidth=1.5;CH.beginPath();CH.moveTo(X(pos),p-10);CH.lineTo(X(pos),H-p);CH.stroke();
+ CH.fillStyle="#5d6b78";CH.fillText("time (s)",W/2-20,H-8);
+}
+function table(){
+ const f=S.fixed.m,a=S.adaptive.m;
+ const rows=[["Average wait (s)",f.avg,a.avg,1],["Longest wait (s)",f.max,a.max,1],["Vehicles served",f.served,a.served,0],["Vehicles turned away (lane full)",f.dropped,a.dropped,1]];
+ if(a.ambN)rows.push(["Ambulance average wait (s)",f.ambAvg,a.ambAvg,1]);
+ $("tb").innerHTML="<tr><th></th><th>Fixed-time</th><th>Adaptive</th><th>Change</th></tr>"+rows.map(([n,x,y,low])=>{
+  const ch=x?((y-x)/x*100):0,good=low?y<=x:y>=x;
+  return `<tr><td>${n}</td><td>${(+x).toFixed(low&&n.includes("wait")?1:0)}</td><td>${(+y).toFixed(low&&n.includes("wait")?1:0)}</td><td class="${good&&ch?"win":""}">${ch?(ch>0?"+":"")+ch.toFixed(0)+"%":"same"}</td></tr>`}).join("");
+}
+function render(){
+ const i=Math.min(T-1,Math.floor(pos)),fr=pos-Math.floor(pos);
+ draw(C[0],S.fixed.f[i],fr);draw(C[1],S.adaptive.f[i],fr);chart();
+ $("clock").textContent=i+" s of "+T+" s";
+ const f=S.adaptive.f[i],n=[];for(let l=0;l<4;l++)if(f[6+l])n.push(NAMES[l]);
+ $("alert").textContent=n.length?"Ambulance waiting in lane "+n.join(", ")+(f[0]>=0&&n.includes(NAMES[f[0]])?" - adaptive signal has given it green":" - adaptive signal is preempting"):"";
+}
+function loop(ts){
+ if(playing){pos=Math.min(T-1,pos+(ts-last)/1000*(+$("sp").value));if(pos>=T-1){playing=false;$("go").textContent="Start simulation"}}
+ last=ts;render();requestAnimationFrame(loop);
+}
+$("go").onclick=()=>{if(pos>=T-1)pos=0;playing=!playing;$("go").textContent=playing?"Pause":"Resume"};
+$("rs").onclick=()=>{pos=0;playing=false;$("go").textContent="Start simulation"};
+$("sc").onchange=e=>{S=D.scenarios[e.target.value];pos=0;playing=false;$("go").textContent="Start simulation";table()};
+table();requestAnimationFrame(loop);
+</script></body></html>
